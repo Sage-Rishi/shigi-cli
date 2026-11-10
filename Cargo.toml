@@ -1,0 +1,16 @@
+[package]
+name = "tern"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rishi Chinta"]
+description = "A CLI tool to spin up DB containers and generate schema diffs"
+
+# Forces the compiled executable to be named "tern"
+[[bin]]
+name = "tern"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+inquire = "0.7"
+tokio = { version = "1.37", features = ["full"] }
