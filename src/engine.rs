@@ -11,48 +11,57 @@ use std::path::Path;
 const CONTAINER_NAME: &str = "tern_shadow_db";
 
 fn get_docker_client(engine: &str) -> Result<Docker, Box<dyn std::error::Error>> {
-    match engine.to_lowercase().as_str() {
-        "podman" => {
-            if let Ok(home) = std::env::var("HOME") {
-                let podman_mac_sock = format!(
-                    "{}/.local/share/containers/podman/machine/podman-machine-default/api.sock",
-                    home
-                );
-                if Path::new(&podman_mac_sock).exists() {
-                    return Ok(Docker::connect_with_unix(
-                        &podman_mac_sock,
-                        120,
-                        bollard::API_DEFAULT_VERSION,
-                    )?);
+    #[cfg(unix)]
+    {
+        match engine.to_lowercase().as_str() {
+            "podman" => {
+                if let Ok(home) = std::env::var("HOME") {
+                    let podman_mac_sock = format!(
+                        "{}/.local/share/containers/podman/machine/podman-machine-default/api.sock",
+                        home
+                    );
+                    if Path::new(&podman_mac_sock).exists() {
+                        return Ok(Docker::connect_with_unix(
+                            &podman_mac_sock,
+                            120,
+                            bollard::API_DEFAULT_VERSION,
+                        )?);
+                    }
                 }
-            }
-            if let Ok(xrd) = std::env::var("XDG_RUNTIME_DIR") {
-                let sock = format!("{}/podman/podman.sock", xrd);
-                if Path::new(&sock).exists() {
-                    return Ok(Docker::connect_with_unix(
-                        &sock,
-                        120,
-                        bollard::API_DEFAULT_VERSION,
-                    )?);
+                if let Ok(xrd) = std::env::var("XDG_RUNTIME_DIR") {
+                    let sock = format!("{}/podman/podman.sock", xrd);
+                    if Path::new(&sock).exists() {
+                        return Ok(Docker::connect_with_unix(
+                            &sock,
+                            120,
+                            bollard::API_DEFAULT_VERSION,
+                        )?);
+                    }
                 }
+                Ok(Docker::connect_with_unix_defaults()?)
             }
-            Ok(Docker::connect_with_unix_defaults()?)
+            _ => {
+                if let Ok(home) = std::env::var("HOME") {
+                    let docker_mac_sock = format!("{}/.docker/run/docker.sock", home);
+                    if !Path::new("/var/run/docker.sock").exists()
+                        && Path::new(&docker_mac_sock).exists()
+                    {
+                        return Ok(Docker::connect_with_unix(
+                            &docker_mac_sock,
+                            120,
+                            bollard::API_DEFAULT_VERSION,
+                        )?);
+                    }
+                }
+                Ok(Docker::connect_with_socket_defaults()?)
+            }
         }
-        _ => {
-            if let Ok(home) = std::env::var("HOME") {
-                let docker_mac_sock = format!("{}/.docker/run/docker.sock", home);
-                if !Path::new("/var/run/docker.sock").exists()
-                    && Path::new(&docker_mac_sock).exists()
-                {
-                    return Ok(Docker::connect_with_unix(
-                        &docker_mac_sock,
-                        120,
-                        bollard::API_DEFAULT_VERSION,
-                    )?);
-                }
-            }
-            Ok(Docker::connect_with_socket_defaults()?)
-        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = engine;
+        Ok(Docker::connect_with_socket_defaults()?)
     }
 }
 

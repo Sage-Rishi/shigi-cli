@@ -15,57 +15,70 @@ pub static CONTAINER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Safely checks if a container daemon (Docker/Podman) is running and accessible
 pub async fn detect_working_container_engine() -> Option<String> {
-    // 1. Try Docker via macOS socket or standard /var/run/docker.sock
-    if let Ok(home) = std::env::var("HOME") {
-        let mac_sock = format!("{}/.docker/run/docker.sock", home);
-        if Path::new(&mac_sock).exists() {
-            if let Ok(docker) =
-                Docker::connect_with_unix(&mac_sock, 2, bollard::API_DEFAULT_VERSION)
-            {
+    #[cfg(unix)]
+    {
+        // 1. Try Docker via macOS socket or standard /var/run/docker.sock
+        if let Ok(home) = std::env::var("HOME") {
+            let mac_sock = format!("{}/.docker/run/docker.sock", home);
+            if Path::new(&mac_sock).exists() {
+                if let Ok(docker) =
+                    Docker::connect_with_unix(&mac_sock, 2, bollard::API_DEFAULT_VERSION)
+                {
+                    if docker.ping().await.is_ok() {
+                        return Some("docker".to_string());
+                    }
+                }
+            }
+        }
+        if Path::new("/var/run/docker.sock").exists() {
+            if let Ok(docker) = Docker::connect_with_socket_defaults() {
                 if docker.ping().await.is_ok() {
                     return Some("docker".to_string());
                 }
             }
         }
+
+        // 2. Try Podman via macOS machine socket or standard runtime dir
+        if let Ok(home) = std::env::var("HOME") {
+            let podman_sock = format!(
+                "{}/.local/share/containers/podman/machine/podman-machine-default/api.sock",
+                home
+            );
+            if Path::new(&podman_sock).exists() {
+                if let Ok(docker) =
+                    Docker::connect_with_unix(&podman_sock, 2, bollard::API_DEFAULT_VERSION)
+                {
+                    if docker.ping().await.is_ok() {
+                        return Some("podman".to_string());
+                    }
+                }
+            }
+        }
+        if let Ok(xrd) = std::env::var("XDG_RUNTIME_DIR") {
+            let podman_sock = format!("{}/podman/podman.sock", xrd);
+            if Path::new(&podman_sock).exists() {
+                if let Ok(docker) =
+                    Docker::connect_with_unix(&podman_sock, 2, bollard::API_DEFAULT_VERSION)
+                {
+                    if docker.ping().await.is_ok() {
+                        return Some("podman".to_string());
+                    }
+                }
+            }
+        }
+
+        None
     }
-    if Path::new("/var/run/docker.sock").exists() {
+
+    #[cfg(not(unix))]
+    {
         if let Ok(docker) = Docker::connect_with_socket_defaults() {
             if docker.ping().await.is_ok() {
                 return Some("docker".to_string());
             }
         }
+        None
     }
-
-    // 2. Try Podman via macOS machine socket or standard runtime dir
-    if let Ok(home) = std::env::var("HOME") {
-        let podman_sock = format!(
-            "{}/.local/share/containers/podman/machine/podman-machine-default/api.sock",
-            home
-        );
-        if Path::new(&podman_sock).exists() {
-            if let Ok(docker) =
-                Docker::connect_with_unix(&podman_sock, 2, bollard::API_DEFAULT_VERSION)
-            {
-                if docker.ping().await.is_ok() {
-                    return Some("podman".to_string());
-                }
-            }
-        }
-    }
-    if let Ok(xrd) = std::env::var("XDG_RUNTIME_DIR") {
-        let podman_sock = format!("{}/podman/podman.sock", xrd);
-        if Path::new(&podman_sock).exists() {
-            if let Ok(docker) =
-                Docker::connect_with_unix(&podman_sock, 2, bollard::API_DEFAULT_VERSION)
-            {
-                if docker.ping().await.is_ok() {
-                    return Some("podman".to_string());
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Helper to read the most recently generated migration file in a directory
