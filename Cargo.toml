@@ -1,9 +1,15 @@
 [package]
 name = "tern"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Rishi Chinta"]
-description = "A CLI tool to spin up DB containers and generate schema diffs"
+description = "A declarative SQL schema diff & migration generator CLI"
+license = "MIT"
+repository = "https://github.com/Sage-Rishi/tern"
+homepage = "https://github.com/Sage-Rishi/tern"
+readme = "README.md"
+keywords = ["database", "migration", "schema", "diff", "sql"]
+categories = ["command-line-utilities", "database"]
 
 # Forces the compiled executable to be named "tern"
 [[bin]]

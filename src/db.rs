@@ -1,26 +1,140 @@
 use crate::config::compute_migrations_lock;
 use chrono::Utc;
 use sqlx::any::AnyPoolOptions;
-use sqlx::{Any, Pool, Row};
+use sqlx::{Any, Executor, Pool, Row};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 
 pub type AnyPool = Pool<Any>;
+
+static SQLITE_SHADOW_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Safely splits a SQL script into individual executable statements,
+/// taking into account semicolons inside single quotes, double quotes, dollar-quotes,
+/// and procedural BEGIN ... END blocks.
+pub fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_dollar_quote: Option<String> = None;
+    let mut begin_depth = 0;
+
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_single_quote && !in_double_quote && in_dollar_quote.is_none() {
+            if c == '$' {
+                if let Some(end_dollar) = sql[i + 1..].find('$') {
+                    let tag = &sql[i..=i + 1 + end_dollar];
+                    if tag
+                        .chars()
+                        .skip(1)
+                        .take(tag.len() - 2)
+                        .all(|ch| ch.is_alphanumeric() || ch == '_')
+                    {
+                        in_dollar_quote = Some(tag.to_string());
+                        current.push_str(tag);
+                        i += tag.len();
+                        continue;
+                    }
+                }
+            } else if c == '\'' {
+                in_single_quote = true;
+            } else if c == '"' {
+                in_double_quote = true;
+            } else if c == ';' {
+                if begin_depth == 0 {
+                    let trimmed = current.trim();
+                    if !trimmed.is_empty() {
+                        stmts.push(trimmed.to_string());
+                    }
+                    current.clear();
+                    i += 1;
+                    continue;
+                }
+            } else {
+                let rest_lower = sql[i..].to_lowercase();
+                if (rest_lower.starts_with("begin ")
+                    || rest_lower.starts_with("begin\n")
+                    || rest_lower.starts_with("begin\r")
+                    || rest_lower.starts_with("begin;"))
+                    && (i == 0 || !chars[i - 1].is_alphanumeric())
+                {
+                    begin_depth += 1;
+                } else if (rest_lower.starts_with("end ")
+                    || rest_lower.starts_with("end;")
+                    || rest_lower.starts_with("end\n")
+                    || rest_lower.starts_with("end\r"))
+                    && (i == 0 || !chars[i - 1].is_alphanumeric())
+                    && begin_depth > 0
+                {
+                    begin_depth -= 1;
+                }
+            }
+        } else if in_single_quote {
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    current.push('\'');
+                    current.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+        } else if in_double_quote {
+            if c == '"' {
+                in_double_quote = false;
+            }
+        } else if let Some(ref tag) = in_dollar_quote {
+            if sql[i..].starts_with(tag) {
+                current.push_str(tag);
+                i += tag.len();
+                in_dollar_quote = None;
+                continue;
+            }
+        }
+
+        current.push(c);
+        i += 1;
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        stmts.push(trimmed.to_string());
+    }
+    stmts
+}
 
 pub async fn connect(db_type: &str) -> Result<(AnyPool, String), Box<dyn std::error::Error>> {
     sqlx::any::install_default_drivers();
 
     let url = match db_type.to_lowercase().as_str() {
         "mysql" => "mysql://root:tern_password@127.0.0.1:3306/tern_db".to_string(),
-        "sqlite" => {
-            let db_path = "tern_shadow.db";
-            if Path::new(db_path).exists() {
-                fs::remove_file(db_path)?;
+        sqlite_str if sqlite_str.starts_with("sqlite") => {
+            let db_path = if sqlite_str.contains("://") {
+                sqlite_str
+                    .split("://")
+                    .nth(1)
+                    .unwrap_or("tern_shadow.db")
+                    .to_string()
+            } else {
+                let count = SQLITE_SHADOW_COUNTER.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    "tern_shadow.db".to_string()
+                } else {
+                    format!("tern_shadow_{}.db", count)
+                }
+            };
+            if Path::new(&db_path).exists() {
+                fs::remove_file(&db_path)?;
             }
-            File::create(db_path)?;
+            File::create(&db_path)?;
             format!("sqlite://{}", db_path)
         }
         _ => "postgres://postgres:tern_password@127.0.0.1:5432/postgres".to_string(),
@@ -31,17 +145,23 @@ pub async fn connect(db_type: &str) -> Result<(AnyPool, String), Box<dyn std::er
         db_type
     );
 
+    let max_conns = if db_type.to_lowercase().starts_with("sqlite") {
+        1
+    } else {
+        5
+    };
+
     let pool_options = AnyPoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_conns)
         .acquire_timeout(Duration::from_secs(3));
 
-    let mut retries = 30;
+    let mut retries = 90;
     let pool = loop {
         match pool_options.clone().connect(&url).await {
             Ok(pool) => break pool,
             Err(e) => {
                 if retries == 0 {
-                    return Err(format!("Failed to connect after 30s: {}", e).into());
+                    return Err(format!("Failed to connect after 90s: {}", e).into());
                 }
                 retries -= 1;
                 sleep(Duration::from_secs(1)).await;
@@ -254,10 +374,10 @@ pub async fn apply_target_migrations(
 
         let mut tx = pool.begin().await?;
 
-        for statement in sql.split(';') {
+        for statement in split_sql_statements(&sql) {
             let trimmed = statement.trim();
             if !trimmed.is_empty() {
-                sqlx::query(trimmed).execute(&mut *tx).await.map_err(|e| {
+                tx.execute(trimmed).await.map_err(|e| {
                     format!(
                         "Failed executing '{}' in statement [{}]: {}",
                         filename, trimmed, e
@@ -318,11 +438,10 @@ pub async fn apply_migrations(
         let filename = path.file_name().unwrap().to_string_lossy();
         let sql = fs::read_to_string(&path)?;
 
-        for statement in sql.split(';') {
+        for statement in split_sql_statements(&sql) {
             let trimmed = statement.trim();
             if !trimmed.is_empty() {
-                sqlx::query(trimmed)
-                    .execute(pool)
+                pool.execute(trimmed)
                     .await
                     .map_err(|e| format!("Error executing migration '{}': {}", filename, e))?;
             }

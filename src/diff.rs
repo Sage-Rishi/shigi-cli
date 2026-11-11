@@ -44,6 +44,34 @@ struct NormalizedTable {
     raw_create_sql: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedEnum {
+    name: String,
+    variants: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedTrigger {
+    name: String,
+    table: String,
+    definition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedFunction {
+    name: String,
+    signature: String, // e.g., "add(integer, integer)"
+    definition: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NormalizedSchema {
+    tables: BTreeMap<String, NormalizedTable>,
+    enums: BTreeMap<String, NormalizedEnum>,
+    triggers: BTreeMap<String, NormalizedTrigger>,
+    functions: BTreeMap<String, NormalizedFunction>,
+}
+
 pub async fn generate_diff(
     config: &TernConfig,
     db_url: &str,
@@ -52,24 +80,64 @@ pub async fn generate_diff(
     let db_type = config.project.db_type.to_lowercase();
 
     // 1. Introspect Live Database State
-    let live_tables = introspect_live_db(&db_type, db_url, config).await?;
+    let live_schema = introspect_live_db(&db_type, db_url, config).await?;
     println!(
-        "-> [Live State] Found {} filtered table(s).",
-        live_tables.len()
+        "-> [Live State] Found {} table(s), {} enum(s), {} function(s), {} trigger(s).",
+        live_schema.tables.len(),
+        live_schema.enums.len(),
+        live_schema.functions.len(),
+        live_schema.triggers.len()
     );
 
     // 2. Parse Target Declarative Schema
-    let target_tables = parse_target_schema(&db_type, &config.paths.schema_path, config)?;
+    let target_schema = parse_target_schema(&db_type, &config.paths.schema_path, config)?;
     println!(
-        "-> [Target State] Found {} filtered table(s).",
-        target_tables.len()
+        "-> [Target State] Found {} table(s), {} enum(s), {} function(s), {} trigger(s).",
+        target_schema.tables.len(),
+        target_schema.enums.len(),
+        target_schema.functions.len(),
+        target_schema.triggers.len()
     );
 
     // 3. Compute SQL Diff Statements
     let mut diff_statements: Vec<String> = Vec::new();
 
-    for (table_name, target_table) in &target_tables {
-        match live_tables.get(table_name) {
+    // --- ENUMS (PostgreSQL Only) ---
+    for (enum_name, target_enum) in &target_schema.enums {
+        match live_schema.enums.get(enum_name) {
+            None => {
+                diff_statements.push(format!(
+                    "CREATE TYPE {} AS ENUM ('{}');",
+                    enum_name,
+                    target_enum.variants.join("', '")
+                ));
+            }
+            Some(live_enum) if live_enum.variants != target_enum.variants => {
+                // If variants changed, we must add the new values.
+                // Note: Postgres does not allow dropping enum values without a type recreation.
+                for variant in &target_enum.variants {
+                    if !live_enum.variants.contains(variant) {
+                        diff_statements
+                            .push(format!("ALTER TYPE {} ADD VALUE '{}';", enum_name, variant));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Check for Dropped Enums
+    for enum_name in live_schema.enums.keys() {
+        if !target_schema.enums.contains_key(enum_name) {
+            diff_statements.push(format!("DROP TYPE {};", enum_name));
+        }
+    }
+
+    // --- TABLES & COLUMNS ---
+    let sorted_target_tables = topological_sort(&target_schema.tables);
+    for table_name in &sorted_target_tables {
+        let target_table = target_schema.tables.get(table_name).unwrap();
+        match live_schema.tables.get(table_name) {
             None => {
                 // New Table: Emit CREATE TABLE and any standalone CREATE INDEX statements
                 if let Some(raw_sql) = &target_table.raw_create_sql {
@@ -87,7 +155,7 @@ pub async fn generate_diff(
                 }
             }
             Some(live_table) => {
-                // --- A. Column Diffs ---
+                // A. Column Diffs
                 for (col_name, target_col) in &target_table.columns {
                     match live_table.columns.get(col_name) {
                         None => {
@@ -126,13 +194,13 @@ pub async fn generate_diff(
                     }
                 }
 
-                // --- B. Primary Key Diffs ---
+                // B. Primary Key Diffs
                 if live_table.primary_key != target_table.primary_key {
                     if db_type == "sqlite" {
                         diff_statements.push(format!(
-                            "-- WARNING: Primary key change detected on '{}'. SQLite requires table recreation to alter primary keys.",
-                            table_name
-                        ));
+                                "-- WARNING: Primary key change detected on '{}'. SQLite requires table recreation to alter primary keys.",
+                                table_name
+                            ));
                     } else {
                         if !live_table.primary_key.is_empty() {
                             let drop_pk = match db_type.as_str() {
@@ -154,7 +222,7 @@ pub async fn generate_diff(
                     }
                 }
 
-                // --- C. Foreign Key Diffs (Compared by structural signature) ---
+                // C. Foreign Key Diffs
                 for live_fk in &live_table.foreign_keys {
                     let exists_in_target = target_table.foreign_keys.iter().any(|tfk| {
                         tfk.columns == live_fk.columns
@@ -165,9 +233,9 @@ pub async fn generate_diff(
                     if !exists_in_target {
                         if db_type == "sqlite" {
                             diff_statements.push(format!(
-                                "-- WARNING: Foreign key removal on '{}' ({:?}) requires table rebuild in SQLite.",
-                                table_name, live_fk.columns
-                            ));
+                                    "-- WARNING: Foreign key removal on '{}' ({:?}) requires table rebuild in SQLite.",
+                                    table_name, live_fk.columns
+                                ));
                         } else {
                             let fk_name = live_fk.name.clone().unwrap_or_else(|| {
                                 format!("fk_{}_{}", table_name, live_fk.columns.join("_"))
@@ -197,32 +265,46 @@ pub async fn generate_diff(
                     if !exists_in_live {
                         if db_type == "sqlite" {
                             diff_statements.push(format!(
-                                "-- WARNING: Adding foreign key on '{}' ({:?} -> {}) requires table rebuild in SQLite.",
-                                table_name, target_fk.columns, target_fk.foreign_table
-                            ));
+                                    "-- WARNING: Adding foreign key on '{}' ({:?} -> {}) requires table rebuild in SQLite.",
+                                    table_name, target_fk.columns, target_fk.foreign_table
+                                ));
                         } else {
                             let fk_name = target_fk.name.clone().unwrap_or_else(|| {
                                 format!("fk_{}_{}", table_name, target_fk.columns.join("_"))
                             });
                             diff_statements.push(format!(
-                                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({});",
-                                table_name,
-                                fk_name,
-                                target_fk.columns.join(", "),
-                                target_fk.foreign_table,
-                                target_fk.referred_columns.join(", ")
-                            ));
+                                    "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({});",
+                                    table_name,
+                                    fk_name,
+                                    target_fk.columns.join(", "),
+                                    target_fk.foreign_table,
+                                    target_fk.referred_columns.join(", ")
+                                ));
                         }
                     }
                 }
 
-                // --- D. Secondary Index Diffs ---
+                // D. Secondary Index Diffs
                 for live_idx in &live_table.indexes {
                     let exists_in_target = target_table.indexes.iter().any(|tidx| {
                         tidx.columns == live_idx.columns && tidx.unique == live_idx.unique
                     });
 
                     if !exists_in_target {
+                        // In MySQL, do not drop an index if it is required by a foreign key constraint
+                        if db_type == "mysql"
+                            && (target_table
+                                .foreign_keys
+                                .iter()
+                                .any(|fk| fk.columns == live_idx.columns)
+                                || live_table
+                                    .foreign_keys
+                                    .iter()
+                                    .any(|fk| fk.columns == live_idx.columns))
+                        {
+                            continue;
+                        }
+
                         let drop_idx = match db_type.as_str() {
                             "mysql" => format!("DROP INDEX {} ON {};", live_idx.name, table_name),
                             _ => format!("DROP INDEX {};", live_idx.name),
@@ -251,10 +333,123 @@ pub async fn generate_diff(
         }
     }
 
-    // Check for Dropped Tables
-    for table_name in live_tables.keys() {
-        if !target_tables.contains_key(table_name) {
+    // Check for Dropped Tables (Must be dropped in reverse topological order)
+    let sorted_live_tables = topological_sort(&live_schema.tables);
+    for table_name in sorted_live_tables.iter().rev() {
+        if !target_schema.tables.contains_key(table_name) {
             diff_statements.push(format!("DROP TABLE {};", table_name));
+        }
+    }
+
+    // Check for Dropped Tables
+    for table_name in live_schema.tables.keys() {
+        if !target_schema.tables.contains_key(table_name) {
+            diff_statements.push(format!("DROP TABLE {};", table_name));
+        }
+    }
+
+    // --- FUNCTIONS ---
+    for (signature, target_func) in &target_schema.functions {
+        match live_schema.functions.get(signature) {
+            None => {
+                diff_statements.push(format!("{};", target_func.definition));
+            }
+            Some(live_func) => {
+                // Compare normalized strings to avoid whitespace mismatch
+                let live_clean = live_func
+                    .definition
+                    .replace(|c: char| c.is_whitespace(), "");
+                let target_clean = target_func
+                    .definition
+                    .replace(|c: char| c.is_whitespace(), "");
+
+                let is_same = if db_type == "mysql" && !live_clean.is_empty() {
+                    target_clean.contains(&live_clean)
+                } else {
+                    live_clean == target_clean
+                };
+
+                if !is_same {
+                    if db_type == "mysql" {
+                        diff_statements
+                            .push(format!("DROP FUNCTION IF EXISTS {};", target_func.name));
+                        diff_statements.push(format!(
+                            "{};",
+                            target_func.definition.trim().trim_end_matches(';')
+                        ));
+                    } else {
+                        // For PostgreSQL, use CREATE OR REPLACE
+                        diff_statements.push(format!(
+                            "{};",
+                            target_func
+                                .definition
+                                .replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for Dropped Functions
+    for signature in live_schema.functions.keys() {
+        if !target_schema.functions.contains_key(signature) {
+            // Drop by signature (includes args for Postgres compatibility)
+            diff_statements.push(format!("DROP FUNCTION {};", signature));
+        }
+    }
+
+    // --- TRIGGERS ---
+    for (key, target_trigger) in &target_schema.triggers {
+        match live_schema.triggers.get(key) {
+            None => {
+                diff_statements.push(format!(
+                    "{};",
+                    target_trigger.definition.trim().trim_end_matches(';')
+                ));
+            }
+            Some(live_trigger) => {
+                let live_clean = live_trigger
+                    .definition
+                    .replace(|c: char| c.is_whitespace(), "");
+                let target_clean = target_trigger
+                    .definition
+                    .replace(|c: char| c.is_whitespace(), "");
+
+                let is_same = if db_type == "mysql" && !live_clean.is_empty() {
+                    target_clean.contains(&live_clean)
+                } else {
+                    live_clean == target_clean
+                };
+
+                if !is_same {
+                    let drop_trig = match db_type.as_str() {
+                        "sqlite" => format!("DROP TRIGGER {};", target_trigger.name),
+                        "mysql" => format!("DROP TRIGGER IF EXISTS {};", target_trigger.name),
+                        _ => format!(
+                            "DROP TRIGGER {} ON {};",
+                            target_trigger.name, target_trigger.table
+                        ),
+                    };
+                    diff_statements.push(drop_trig);
+                    diff_statements.push(format!(
+                        "{};",
+                        target_trigger.definition.trim().trim_end_matches(';')
+                    ));
+                }
+            }
+        }
+    }
+
+    // Check for Dropped Triggers
+    for (key, trigger) in &live_schema.triggers {
+        if !target_schema.triggers.contains_key(key) {
+            let drop_trig = match db_type.as_str() {
+                "sqlite" => format!("DROP TRIGGER {};", trigger.name),
+                "mysql" => format!("DROP TRIGGER IF EXISTS {};", trigger.name),
+                _ => format!("DROP TRIGGER {} ON {};", trigger.name, trigger.table),
+            };
+            diff_statements.push(drop_trig);
         }
     }
 
@@ -367,13 +562,13 @@ async fn introspect_live_db(
     db_type: &str,
     db_url: &str,
     config: &TernConfig,
-) -> Result<BTreeMap<String, NormalizedTable>, Box<dyn std::error::Error>> {
-    let mut tables = BTreeMap::new();
+) -> Result<NormalizedSchema, Box<dyn std::error::Error>> {
+    let mut schema = NormalizedSchema::default();
 
     match db_type {
         "postgres" => {
             let pool = PgPool::connect(db_url).await?;
-            let schema = PgDiscovery::new(pool.clone(), "public").discover().await?;
+            let live_schema = PgDiscovery::new(pool.clone(), "public").discover().await?;
 
             // Query pg_indexes for secondary indexes & unique constraints
             let idx_rows = sqlx::query(
@@ -382,7 +577,7 @@ async fn introspect_live_db(
             .fetch_all(&pool)
             .await?;
 
-            for t in schema.tables {
+            for t in live_schema.tables {
                 let t_name = t.info.name.to_lowercase();
                 if !should_include_table(&t_name, config) {
                     continue;
@@ -434,7 +629,6 @@ async fn introspect_live_db(
                                 cols_str.split(',').map(|s| clean_ident(s.trim())).collect();
                             let unique = idx_def.to_uppercase().contains("UNIQUE INDEX");
 
-                            // Avoid duplicating single-column inline UNIQUE constraints if identical
                             indexes.push(NormalizedIndex {
                                 name: idx_name.to_lowercase(),
                                 columns: idx_cols,
@@ -444,7 +638,7 @@ async fn introspect_live_db(
                     }
                 }
 
-                tables.insert(
+                schema.tables.insert(
                     t_name.clone(),
                     NormalizedTable {
                         name: t_name,
@@ -456,11 +650,98 @@ async fn introspect_live_db(
                     },
                 );
             }
+
+            // 2. Fetch Custom ENUMs
+            let enum_rows = sqlx::query(
+                "SELECT t.typname AS name, array_agg(e.enumlabel ORDER BY e.enumsortorder) AS variants
+                 FROM pg_type t
+                 JOIN pg_enum e ON t.oid = e.enumtypid
+                 JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE n.nspname = 'public'
+                 GROUP BY t.typname",
+            )
+            .fetch_all(&pool)
+            .await?;
+
+            for row in enum_rows {
+                let name: String = row.get("name");
+                let variants: Vec<String> = row.get("variants");
+                schema
+                    .enums
+                    .insert(name.clone(), NormalizedEnum { name, variants });
+            }
+
+            // 3. Fetch Functions
+            let func_rows = sqlx::query(
+                "SELECT p.proname AS name,
+                        pg_get_function_identity_arguments(p.oid) AS args,
+                        pg_get_functiondef(p.oid) AS def
+                 FROM pg_proc p
+                 JOIN pg_namespace n ON p.pronamespace = n.oid
+                 WHERE n.nspname = 'public'",
+            )
+            .fetch_all(&pool)
+            .await?;
+
+            for row in func_rows {
+                let name: String = row.get("name");
+                let args_raw: String = row.get("args");
+                let definition: String = row.get("def");
+
+                let mut arg_types = Vec::new();
+                for arg in args_raw.split(',') {
+                    let trimmed = arg.trim();
+                    if !trimmed.is_empty() {
+                        if let Some(dt) = trimmed.split_whitespace().last() {
+                            arg_types.push(clean_ident(dt));
+                        }
+                    }
+                }
+                let signature = format!("{}({})", name.to_lowercase(), arg_types.join(", "));
+
+                schema.functions.insert(
+                    signature.clone(),
+                    NormalizedFunction {
+                        name,
+                        signature,
+                        definition,
+                    },
+                );
+            }
+
+            // 4. Fetch Triggers
+            let trig_rows = sqlx::query(
+                "SELECT t.tgname AS name, c.relname AS table_name, pg_get_triggerdef(t.oid) AS def
+                 FROM pg_trigger t
+                 JOIN pg_class c ON t.tgrelid = c.oid
+                 JOIN pg_namespace n ON c.relnamespace = n.oid
+                 WHERE n.nspname = 'public' AND NOT t.tgisinternal",
+            )
+            .fetch_all(&pool)
+            .await?;
+
+            for row in trig_rows {
+                let name: String = row.get("name");
+                let table: String = row.get("table_name");
+                let definition: String = row.get("def");
+
+                let key = format!("{}_{}", table, name);
+                schema.triggers.insert(
+                    key,
+                    NormalizedTrigger {
+                        name,
+                        table,
+                        definition,
+                    },
+                );
+            }
         }
         "mysql" => {
             let pool = MySqlPool::connect(db_url).await?;
-            let schema = MySqlDiscovery::new(pool, "tern_db").discover().await?;
-            for t in schema.tables {
+            let live_schema = MySqlDiscovery::new(pool.clone(), "tern_db")
+                .discover()
+                .await?;
+            for t in live_schema.tables {
                 let t_name = t.info.name.to_lowercase();
                 if !should_include_table(&t_name, config) {
                     continue;
@@ -486,6 +767,12 @@ async fn introspect_live_db(
                     .map(|fk| fk.name.to_lowercase())
                     .collect();
 
+                let fk_col_sets: Vec<Vec<String>> = t
+                    .foreign_keys
+                    .iter()
+                    .map(|fk| fk.columns.iter().map(|c| c.to_lowercase()).collect())
+                    .collect();
+
                 for idx in t.indexes {
                     let idx_name = idx.name.to_lowercase();
                     let idx_cols: Vec<String> =
@@ -493,7 +780,9 @@ async fn introspect_live_db(
 
                     if idx_name == "primary" {
                         pk_cols = idx_cols;
-                    } else if !fk_names.contains(&idx_name) {
+                    } else if !fk_names.contains(&idx_name)
+                        && !(!idx.unique && fk_col_sets.contains(&idx_cols))
+                    {
                         indexes.push(NormalizedIndex {
                             name: idx_name,
                             columns: idx_cols,
@@ -516,7 +805,7 @@ async fn introspect_live_db(
                     });
                 }
 
-                tables.insert(
+                schema.tables.insert(
                     t_name.clone(),
                     NormalizedTable {
                         name: t_name,
@@ -528,11 +817,117 @@ async fn introspect_live_db(
                     },
                 );
             }
+
+            // 1. Fetch Functions (Routines)
+            let func_rows = sqlx::query(
+                "SELECT CONVERT(ROUTINE_NAME USING utf8mb4) AS name,
+                        CONVERT(ROUTINE_DEFINITION USING utf8mb4) AS def
+                 FROM information_schema.ROUTINES
+                 WHERE ROUTINE_SCHEMA = 'tern_db' AND ROUTINE_TYPE = 'FUNCTION'",
+            )
+            .fetch_all(&pool)
+            .await?;
+
+            for row in func_rows {
+                let name: String = row
+                    .try_get("name")
+                    .ok()
+                    .or_else(|| {
+                        row.try_get::<Vec<u8>, _>("name")
+                            .ok()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    })
+                    .unwrap_or_default();
+
+                let def_opt: Option<String> = row
+                    .try_get("def")
+                    .ok()
+                    .or_else(|| {
+                        row.try_get::<Vec<u8>, _>("def")
+                            .ok()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    })
+                    .or_else(|| {
+                        row.try_get::<Option<Vec<u8>>, _>("def")
+                            .ok()
+                            .flatten()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    });
+                let definition = def_opt.unwrap_or_default();
+
+                schema.functions.insert(
+                    name.clone(),
+                    NormalizedFunction {
+                        name: name.clone(),
+                        signature: name,
+                        definition,
+                    },
+                );
+            }
+
+            // 2. Fetch Triggers
+            let trig_rows = sqlx::query(
+                "SELECT CONVERT(TRIGGER_NAME USING utf8mb4) AS name,
+                        CONVERT(EVENT_OBJECT_TABLE USING utf8mb4) AS table_name,
+                        CONVERT(ACTION_STATEMENT USING utf8mb4) AS def
+                 FROM information_schema.TRIGGERS
+                 WHERE TRIGGER_SCHEMA = 'tern_db'",
+            )
+            .fetch_all(&pool)
+            .await?;
+
+            for row in trig_rows {
+                let name: String = row
+                    .try_get("name")
+                    .ok()
+                    .or_else(|| {
+                        row.try_get::<Vec<u8>, _>("name")
+                            .ok()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    })
+                    .unwrap_or_default();
+
+                let table: String = row
+                    .try_get("table_name")
+                    .ok()
+                    .or_else(|| {
+                        row.try_get::<Vec<u8>, _>("table_name")
+                            .ok()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    })
+                    .unwrap_or_default();
+
+                let def_opt: Option<String> = row
+                    .try_get("def")
+                    .ok()
+                    .or_else(|| {
+                        row.try_get::<Vec<u8>, _>("def")
+                            .ok()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    })
+                    .or_else(|| {
+                        row.try_get::<Option<Vec<u8>>, _>("def")
+                            .ok()
+                            .flatten()
+                            .map(|b| String::from_utf8_lossy(&b).to_string())
+                    });
+                let definition = def_opt.unwrap_or_default();
+
+                let key = format!("{}_{}", table, name);
+                schema.triggers.insert(
+                    key,
+                    NormalizedTrigger {
+                        name,
+                        table,
+                        definition,
+                    },
+                );
+            }
         }
         "sqlite" => {
             let pool = SqlitePool::connect(db_url).await?;
-            let schema = SqliteDiscovery::new(pool.clone()).discover().await?;
-            for t in schema.tables {
+            let live_schema = SqliteDiscovery::new(pool.clone()).discover().await?;
+            for t in live_schema.tables {
                 let t_name = t.name.to_lowercase();
                 if !should_include_table(&t_name, config) {
                     continue;
@@ -609,7 +1004,7 @@ async fn introspect_live_db(
                     });
                 }
 
-                tables.insert(
+                schema.tables.insert(
                     t_name.clone(),
                     NormalizedTable {
                         name: t_name,
@@ -621,18 +1016,324 @@ async fn introspect_live_db(
                     },
                 );
             }
+
+            // 1. Fetch Triggers
+            let trig_rows =
+                sqlx::query("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'")
+                    .fetch_all(&pool)
+                    .await?;
+
+            for row in trig_rows {
+                let name: String = row.get("name");
+                let table: String = row.get("tbl_name");
+                if let Ok(definition) = row.try_get::<String, _>("sql") {
+                    let key = format!("{}_{}", table, name);
+                    schema.triggers.insert(
+                        key,
+                        NormalizedTrigger {
+                            name,
+                            table,
+                            definition,
+                        },
+                    );
+                }
+            }
         }
         _ => return Err("Unsupported database type".into()),
     }
 
-    Ok(tables)
+    Ok(schema)
+}
+
+fn extract_enums_from_sql(sql: &str) -> (BTreeMap<String, NormalizedEnum>, String) {
+    let mut enums = BTreeMap::new();
+    let mut remaining = String::new();
+    let chars: Vec<char> = sql.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let rest = &sql[i..];
+        let lower = rest.to_lowercase();
+        let trimmed_lower = lower.trim_start();
+        if trimmed_lower.starts_with("create")
+            && (trimmed_lower.starts_with("create type")
+                || trimmed_lower[6..].trim_start().starts_with("type"))
+        {
+            if let Some(semi_pos) = rest.find(';') {
+                let stmt_str = &rest[..semi_pos];
+                let stmt_lower = stmt_str.to_lowercase();
+                if stmt_lower.contains("as enum") {
+                    if let Some(as_enum_idx) = stmt_lower.find("as enum") {
+                        let before_as = stmt_str[..as_enum_idx].trim();
+                        let type_name = before_as
+                            .split_whitespace()
+                            .last()
+                            .map(clean_ident)
+                            .unwrap_or_default();
+
+                        if let (Some(lparen), Some(rparen)) =
+                            (stmt_str.find('('), stmt_str.rfind(')'))
+                        {
+                            let inside = &stmt_str[lparen + 1..rparen];
+                            let variants: Vec<String> = inside
+                                .split(',')
+                                .map(|s| s.trim().trim_matches('\'').trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            if !type_name.is_empty() {
+                                enums.insert(
+                                    type_name.clone(),
+                                    NormalizedEnum {
+                                        name: type_name,
+                                        variants,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    i += semi_pos + 1;
+                    continue;
+                }
+            }
+        }
+        remaining.push(chars[i]);
+        i += 1;
+    }
+
+    (enums, remaining)
+}
+
+fn extract_triggers_from_sql(sql: &str) -> (BTreeMap<String, NormalizedTrigger>, String) {
+    let mut triggers = BTreeMap::new();
+    let mut remaining = String::new();
+    let chars: Vec<char> = sql.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let rest = &sql[i..];
+        let lower = rest.to_lowercase();
+        let trimmed_lower = lower.trim_start();
+        if trimmed_lower.starts_with("create")
+            && (trimmed_lower.contains("trigger")
+                && (trimmed_lower.starts_with("create trigger")
+                    || trimmed_lower.starts_with("create or replace trigger")
+                    || trimmed_lower.starts_with("create temporary trigger")
+                    || trimmed_lower.starts_with("create constraint trigger")))
+        {
+            let mut end_pos = None;
+            let mut in_begin = 0;
+            let mut j = 0;
+            let rest_chars: Vec<char> = rest.chars().collect();
+            while j < rest_chars.len() {
+                let sub = &rest[j..].to_lowercase();
+                if sub.starts_with("begin")
+                    && !sub[5..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                {
+                    in_begin += 1;
+                    j += 5;
+                    continue;
+                }
+                if sub.starts_with("end")
+                    && !sub[3..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                {
+                    if in_begin > 0 {
+                        in_begin -= 1;
+                    }
+                    j += 3;
+                    continue;
+                }
+                if rest_chars[j] == ';' && in_begin == 0 {
+                    end_pos = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+
+            if let Some(semi_pos) = end_pos {
+                let stmt_str = rest[..=semi_pos].trim();
+                let stmt_lower = stmt_str.to_lowercase();
+
+                // Find trigger name right after TRIGGER keyword
+                if let Some(trig_idx) = stmt_lower.find("trigger") {
+                    let after_trigger = stmt_str[trig_idx + 7..].trim_start();
+                    let mut tokens = after_trigger.split_whitespace();
+                    let mut first = tokens.next().unwrap_or_default();
+                    if first.eq_ignore_ascii_case("if") {
+                        let _not = tokens.next();
+                        let _exists = tokens.next();
+                        first = tokens.next().unwrap_or_default();
+                    }
+                    let trig_name = clean_ident(first);
+
+                    // Find table name right after ON keyword
+                    if let Some(on_idx) = stmt_lower.find(" on ") {
+                        let after_on = stmt_str[on_idx + 4..].trim_start();
+                        let tbl_name = after_on
+                            .split_whitespace()
+                            .next()
+                            .map(clean_ident)
+                            .unwrap_or_default();
+
+                        if !trig_name.is_empty() && !tbl_name.is_empty() {
+                            let key = format!("{}_{}", tbl_name, trig_name);
+                            triggers.insert(
+                                key,
+                                NormalizedTrigger {
+                                    name: trig_name,
+                                    table: tbl_name,
+                                    definition: stmt_str.trim().trim_end_matches(';').to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+                i += semi_pos + 1;
+                continue;
+            }
+        }
+        remaining.push(chars[i]);
+        i += 1;
+    }
+
+    (triggers, remaining)
+}
+
+fn extract_functions_from_sql(
+    db_type: &str,
+    sql: &str,
+) -> (BTreeMap<String, NormalizedFunction>, String) {
+    let mut functions = BTreeMap::new();
+    let mut remaining = String::new();
+    let chars: Vec<char> = sql.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let rest = &sql[i..];
+        let lower = rest.to_lowercase();
+        let trimmed_lower = lower.trim_start();
+        if trimmed_lower.starts_with("create")
+            && (trimmed_lower.starts_with("create function")
+                || trimmed_lower.starts_with("create or replace function")
+                || trimmed_lower.starts_with("create definite function"))
+        {
+            let mut end_pos = None;
+            let mut in_dollar_quote: Option<String> = None;
+            let mut in_begin = 0;
+            let mut j = 0;
+            let rest_chars: Vec<char> = rest.chars().collect();
+            while j < rest_chars.len() {
+                if in_dollar_quote.is_none() {
+                    if rest_chars[j] == '$' {
+                        if let Some(end_dollar) = rest[j + 1..].find('$') {
+                            let tag = &rest[j..=j + 1 + end_dollar];
+                            if tag
+                                .chars()
+                                .skip(1)
+                                .take(tag.len() - 2)
+                                .all(|ch| ch.is_alphanumeric() || ch == '_')
+                            {
+                                in_dollar_quote = Some(tag.to_string());
+                                j += tag.len();
+                                continue;
+                            }
+                        }
+                    }
+                    let sub = &rest[j..].to_lowercase();
+                    if sub.starts_with("begin")
+                        && !sub[5..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    {
+                        in_begin += 1;
+                        j += 5;
+                        continue;
+                    }
+                    if sub.starts_with("end")
+                        && !sub[3..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    {
+                        if in_begin > 0 {
+                            in_begin -= 1;
+                        }
+                        j += 3;
+                        continue;
+                    }
+                    if rest_chars[j] == ';' && in_begin == 0 {
+                        end_pos = Some(j);
+                        break;
+                    }
+                } else if let Some(ref tag) = in_dollar_quote {
+                    if rest[j..].starts_with(tag) {
+                        j += tag.len();
+                        in_dollar_quote = None;
+                        continue;
+                    }
+                }
+                j += 1;
+            }
+
+            if let Some(semi_pos) = end_pos {
+                let stmt_str = rest[..=semi_pos].trim();
+                let stmt_lower = stmt_str.to_lowercase();
+
+                if let Some(func_idx) = stmt_lower.find("function") {
+                    let after_func = stmt_str[func_idx + 8..].trim_start();
+                    let func_name = after_func
+                        .split(|c: char| c == '(' || c.is_whitespace())
+                        .next()
+                        .map(clean_ident)
+                        .unwrap_or_default();
+
+                    let mut arg_types = Vec::new();
+                    if let (Some(lparen), Some(rparen)) = (stmt_str.find('('), stmt_str.find(')')) {
+                        if rparen > lparen {
+                            let args_str = &stmt_str[lparen + 1..rparen];
+                            for arg in args_str.split(',') {
+                                let arg_trimmed = arg.trim();
+                                if !arg_trimmed.is_empty() {
+                                    if let Some(dt) = arg_trimmed.split_whitespace().last() {
+                                        arg_types.push(clean_ident(dt));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let signature = if db_type == "postgres" {
+                        format!("{}({})", func_name.to_lowercase(), arg_types.join(", "))
+                    } else {
+                        func_name.clone()
+                    };
+
+                    if !func_name.is_empty() {
+                        functions.insert(
+                            signature.clone(),
+                            NormalizedFunction {
+                                name: func_name,
+                                signature,
+                                definition: stmt_str.trim().trim_end_matches(';').to_string(),
+                            },
+                        );
+                    }
+                }
+
+                i += semi_pos + 1;
+                continue;
+            }
+        }
+        remaining.push(chars[i]);
+        i += 1;
+    }
+
+    (functions, remaining)
 }
 
 fn parse_target_schema(
     db_type: &str,
     schema_path: &str,
     config: &TernConfig,
-) -> Result<BTreeMap<String, NormalizedTable>, Box<dyn std::error::Error>> {
+) -> Result<NormalizedSchema, Box<dyn std::error::Error>> {
     let path = Path::new(schema_path);
     if !path.exists() {
         return Err(format!("Schema path '{}' does not exist.", schema_path).into());
@@ -643,7 +1344,8 @@ fn parse_target_schema(
         sql_files.push(path.to_path_buf());
     } else {
         for entry in fs::read_dir(path)? {
-            let p = entry?.path();
+            let entry = entry?;
+            let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("sql") {
                 sql_files.push(p);
             }
@@ -657,19 +1359,29 @@ fn parse_target_schema(
         combined_sql.push('\n');
     }
 
-    let statements = match db_type {
-        "postgres" => Parser::parse_sql(&PostgreSqlDialect {}, &combined_sql)?,
-        "mysql" => Parser::parse_sql(&MySqlDialect {}, &combined_sql)?,
-        "sqlite" => Parser::parse_sql(&SQLiteDialect {}, &combined_sql)?,
-        _ => return Err("Unsupported database type".into()),
+    let (enums, without_enums) = extract_enums_from_sql(&combined_sql);
+    let (triggers, without_triggers) = extract_triggers_from_sql(&without_enums);
+    let (functions, remaining_sql) = extract_functions_from_sql(db_type, &without_triggers);
+
+    let mut schema = NormalizedSchema {
+        tables: BTreeMap::new(),
+        enums,
+        triggers,
+        functions,
     };
 
-    let mut tables = BTreeMap::new();
+    let dialect: Box<dyn sqlparser::dialect::Dialect> = match db_type {
+        "mysql" => Box::new(MySqlDialect {}),
+        "sqlite" => Box::new(SQLiteDialect {}),
+        _ => Box::new(PostgreSqlDialect {}),
+    };
+
+    let statements = Parser::parse_sql(&*dialect, &remaining_sql)?;
     let mut standalone_indexes: Vec<(String, NormalizedIndex)> = Vec::new();
 
     for stmt in statements {
-        match &stmt {
-            Statement::CreateTable(create_table) => {
+        match stmt {
+            Statement::CreateTable(ref create_table) => {
                 let t_name = extract_table_name(&create_table.name);
                 if !should_include_table(&t_name, config) {
                     continue;
@@ -790,7 +1502,7 @@ fn parse_target_schema(
                     }
                 }
 
-                tables.insert(
+                schema.tables.insert(
                     t_name.clone(),
                     NormalizedTable {
                         name: t_name,
@@ -827,16 +1539,83 @@ fn parse_target_schema(
                     },
                 ));
             }
+            Statement::CreateFunction {
+                ref name, ref args, ..
+            } => {
+                let f_name = extract_table_name(name);
+                let definition = stmt.to_string();
+
+                let arg_types: Vec<String> = args
+                    .as_ref()
+                    .map(|v| v.iter().map(|a| a.data_type.to_string()).collect())
+                    .unwrap_or_default();
+
+                let signature = if db_type == "postgres" {
+                    format!("{}({})", f_name, arg_types.join(", "))
+                } else {
+                    f_name.clone()
+                };
+
+                schema.functions.insert(
+                    signature.clone(),
+                    NormalizedFunction {
+                        name: f_name,
+                        signature,
+                        definition,
+                    },
+                );
+            }
             _ => {}
         }
     }
 
     // Attach standalone CREATE INDEX statements to their target tables
     for (t_name, idx) in standalone_indexes {
-        if let Some(table) = tables.get_mut(&t_name) {
+        if let Some(table) = schema.tables.get_mut(&t_name) {
             table.indexes.push(idx);
         }
     }
 
-    Ok(tables)
+    Ok(schema)
+}
+
+// Add to the bottom of src/diff.rs
+fn topological_sort(tables: &BTreeMap<String, NormalizedTable>) -> Vec<String> {
+    let mut sorted = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut visiting = std::collections::HashSet::new();
+
+    fn visit(
+        table: &str,
+        tables: &BTreeMap<String, NormalizedTable>,
+        visited: &mut std::collections::HashSet<String>,
+        visiting: &mut std::collections::HashSet<String>,
+        sorted: &mut Vec<String>,
+    ) {
+        if visited.contains(table) {
+            return;
+        }
+        // Break circular references to avoid infinite loops
+        if visiting.contains(table) {
+            return;
+        }
+
+        visiting.insert(table.to_string());
+
+        if let Some(t) = tables.get(table) {
+            for fk in &t.foreign_keys {
+                visit(&fk.foreign_table, tables, visited, visiting, sorted);
+            }
+        }
+
+        visiting.remove(table);
+        visited.insert(table.to_string());
+        sorted.push(table.to_string());
+    }
+
+    for table in tables.keys() {
+        visit(table, tables, &mut visited, &mut visiting, &mut sorted);
+    }
+
+    sorted
 }

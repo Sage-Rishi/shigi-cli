@@ -31,7 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let diff_res = diff::generate_diff(&config, &db_url, name).await;
 
             if db_type == "sqlite" {
-                let _ = std::fs::remove_file("tern_shadow.db");
+                let path = db_url.strip_prefix("sqlite://").unwrap_or("tern_shadow.db");
+                let _ = std::fs::remove_file(path);
             } else {
                 engine::teardown_container(&engine).await?;
             }
