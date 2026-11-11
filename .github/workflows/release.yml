@@ -3,16 +3,19 @@ name: Release & Publish
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v1.0.0)'
+        description: "Tag to release (e.g. v1.0.0)"
         required: true
-        default: 'v1.0.0'
+        default: "v1.0.0"
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 jobs:
   # =========================================================================
@@ -52,6 +55,9 @@ jobs:
     name: Publish to Cargo Store (crates.io)
     needs: [verify]
     runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/tern
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
