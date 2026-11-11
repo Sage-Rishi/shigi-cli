@@ -3,7 +3,7 @@ use clap::Parser;
 use tern::cli::{self, Cli, Commands};
 use tern::config::{self, TernConfig};
 use tern::db;
-use tern::diff;
+use tern::differential_engine;
 use tern::engine;
 
 #[tokio::main]
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (pool, db_url) = db::connect(db_type).await?;
             db::apply_migrations(&pool, &config.paths.migrations_dir).await?;
 
-            let diff_res = diff::generate_diff(&config, &db_url, name).await;
+            let diff_res = differential_engine::generate_diff(&config, &db_url, name).await;
 
             if db_type == "sqlite" {
                 let path = db_url.strip_prefix("sqlite://").unwrap_or("tern_shadow.db");

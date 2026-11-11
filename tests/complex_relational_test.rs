@@ -7,7 +7,7 @@ use common::{
 use std::fs;
 use tern::config::{FilterConfig, PathConfig, ProjectConfig, TernConfig};
 use tern::db;
-use tern::diff;
+use tern::differential_engine;
 
 async fn test_large_complex_sqlite_relational_network() {
     let base_dir = "tests/temp_large_complex_sqlite";
@@ -91,7 +91,8 @@ async fn test_large_complex_sqlite_relational_network() {
     let (pool, db_url) = db::connect("sqlite").await.unwrap();
     db::apply_migrations(&pool, &migrations_dir).await.unwrap();
 
-    let diff_result = diff::generate_diff(&config, &db_url, "verify_zero_drift").await;
+    let diff_result =
+        differential_engine::generate_diff(&config, &db_url, "verify_zero_drift").await;
     assert!(
         diff_result.is_ok(),
         "Diff against replayed schema failed: {:?}",

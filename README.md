@@ -160,7 +160,12 @@ tern/
     ├── config.rs       # `tern.toml` parser and SHA-256 `tern.lock` integrity engine
     ├── engine.rs       # Bollard Docker/Podman container provisioning and teardown
     ├── db.rs           # SQLx connection pooling, shadow replay, and `_tern_migrations` state
-    └── diff.rs         # `sea-schema` introspection, `sqlparser` AST, and DDL generator
+    └── differential_engine/ # Modular schema diffing engine & database adapters
+        ├── mod.rs      # Engine orchestrator and diff generator
+        ├── model.rs    # Normalized database schema models
+        ├── parser.rs   # Declarative SQL schema parser and entity extractors
+        ├── topological.rs # Dependency resolution & topological sorting
+        └── adapters/   # Database dialect adapters (Postgres, MySQL, SQLite)
 ```
 
 ---

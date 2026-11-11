@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tern::config::{FilterConfig, PathConfig, ProjectConfig, TernConfig};
 use tern::db;
-use tern::diff;
+use tern::differential_engine;
 use tern::engine;
 use tokio::sync::Mutex;
 
@@ -116,7 +116,7 @@ pub async fn simulate_tern_generate(
 
     let (pool, db_url) = db::connect(db_type).await.unwrap();
     db::apply_migrations(&pool, migrations_dir).await.unwrap();
-    diff::generate_diff(&config, &db_url, step_name)
+    differential_engine::generate_diff(&config, &db_url, step_name)
         .await
         .unwrap();
 
