@@ -1,0 +1,13 @@
+CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    title TEXT NOT NULL,
+    body TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);

@@ -1,0 +1,12 @@
+CREATE TABLE users (
+    id UUID PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE posts (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES users(id),
+    title VARCHAR(255) NOT NULL,
+    body TEXT
+);
