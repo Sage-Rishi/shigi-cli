@@ -70,11 +70,15 @@ pub async fn provision_container(
 
     let docker = get_docker_client(engine)?;
 
+    // In src/engine.rs
     let (image, port, env) = match db_type.as_str() {
         "mysql" => (
             "mysql:8",
             "3306/tcp",
-            vec!["MYSQL_ROOT_PASSWORD=tern_password"],
+            vec![
+                "MYSQL_ROOT_PASSWORD=tern_password",
+                "MYSQL_DATABASE=tern_db",
+            ],
         ),
         _ => (
             "postgres:latest",

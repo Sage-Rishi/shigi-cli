@@ -14,7 +14,7 @@ pub async fn connect(db_type: &str) -> Result<(AnyPool, String), Box<dyn std::er
     sqlx::any::install_default_drivers();
 
     let url = match db_type.to_lowercase().as_str() {
-        "mysql" => "mysql://root:tern_password@127.0.0.1:3306/mysql".to_string(),
+        "mysql" => "mysql://root:tern_password@127.0.0.1:3306/tern_db".to_string(),
         "sqlite" => {
             let db_path = "tern_shadow.db";
             if Path::new(db_path).exists() {

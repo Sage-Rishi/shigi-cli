@@ -319,22 +319,48 @@ fn extract_table_name(obj: &ObjectName) -> String {
 }
 
 fn normalize_type(dtype: &str) -> String {
-    let lower = dtype.to_lowercase();
-    if lower.contains("varchar")
-        || lower.contains("character varying")
-        || lower.contains("text")
-        || lower.contains("string")
-    {
-        "string_like".to_string()
-    } else if lower.contains("int") || lower.contains("serial") || lower.contains("integer") {
-        "int_like".to_string()
-    } else if lower.contains("timestamp") || lower.contains("datetime") {
-        "timestamp_like".to_string()
-    } else if lower.contains("uuid") {
-        "uuid".to_string()
-    } else {
-        lower
+    let mut lower = dtype.to_lowercase();
+
+    // Strip all whitespace to normalize differences like "VARCHAR (50)" vs "varchar(50)"
+    lower.retain(|c| !c.is_whitespace());
+
+    // 1. Normalize sea-schema's Debug format for bounded strings
+    if lower.starts_with("string(some(") {
+        let len = lower
+            .trim_start_matches("string(some(")
+            .trim_end_matches("))");
+        return format!("varchar({})", len);
     }
+
+    // 2. Normalize sea-schema's unbounded string type
+    if lower == "string(none)" {
+        return "text".to_string();
+    }
+
+    // 3. Normalize sqlparser's Postgres character varying alias
+    if lower.starts_with("charactervarying(") {
+        let len = lower
+            .trim_start_matches("charactervarying(")
+            .trim_end_matches(')');
+        return format!("varchar({})", len);
+    }
+
+    // 4. Group all integer variants (ignoring MySQL display widths like int(11))
+    if lower.starts_with("int") || lower == "integer" || lower == "serial" {
+        return "int".to_string();
+    }
+
+    // 5. Group timestamps
+    if lower.contains("timestamp") || lower.contains("datetime") {
+        return "timestamp".to_string();
+    }
+
+    // 6. Group UUIDs
+    if lower.contains("uuid") {
+        return "uuid".to_string();
+    }
+
+    lower
 }
 
 async fn introspect_live_db(
@@ -433,7 +459,7 @@ async fn introspect_live_db(
         }
         "mysql" => {
             let pool = MySqlPool::connect(db_url).await?;
-            let schema = MySqlDiscovery::new(pool, "mysql").discover().await?;
+            let schema = MySqlDiscovery::new(pool, "tern_db").discover().await?;
             for t in schema.tables {
                 let t_name = t.info.name.to_lowercase();
                 if !should_include_table(&t_name, config) {
