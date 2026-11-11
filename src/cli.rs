@@ -28,6 +28,16 @@ pub enum Commands {
         #[arg(short, long, default_value = "auto_diff")]
         name: String,
     },
+    /// Verify migration integrity, checksums, lockfile, and schema validity (suitable for CI/CD)
+    Verify {
+        /// Target database connection URL (overrides tern.toml and DATABASE_URL)
+        #[arg(short, long)]
+        url: Option<String>,
+
+        /// Path to configuration file (defaults to tern.toml)
+        #[arg(short, long)]
+        config: Option<String>,
+    },
     /// Check which migrations have been applied to the target database
     Status {
         /// Target database connection URL (overrides tern.toml and DATABASE_URL)
@@ -133,6 +143,28 @@ pub fn run_init_wizard() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    let exclude_schemas_raw =
+        Text::new("Schemas to exclude from diffing (comma-separated, leave blank for none):")
+            .with_default("")
+            .prompt()?;
+
+    let include_schemas_raw =
+        Text::new("Schemas to exclusively include (comma-separated, leave blank for all):")
+            .with_default("")
+            .prompt()?;
+
+    let exclude_schemas = exclude_schemas_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let include_schemas = include_schemas_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let config = TernConfig {
         project: ProjectConfig {
             db_type,
@@ -146,6 +178,8 @@ pub fn run_init_wizard() -> Result<(), Box<dyn std::error::Error>> {
         filter: FilterConfig {
             include_tables,
             exclude_tables,
+            include_schemas,
+            exclude_schemas,
         },
     };
 

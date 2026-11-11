@@ -67,6 +67,8 @@ migrations_dir = "migrations"
 [filter]
 include_tables = []
 exclude_tables = ["_tern_migrations", "_sqlx_migrations"]
+include_schemas = []
+exclude_schemas = []
 ```
 
 ### 2. Define Your Declarative Schema
@@ -124,15 +126,29 @@ Summary: 1 applied, 1 pending.
 
 ### 5. Apply Migrations (`tern apply`)
 
-Preview pending migrations using `--dry-run`, or execute them transactionally against your target database:
+Preview pending migrations using `--dry-run`, or execute them transactionally against your target database. Before applying any migration, Tern automatically performs strict checksum validation against `tern.lock` and ensures zero drift with previously applied database records:
 
 ```bash
 # Preview pending migrations without executing
 tern apply --dry-run
 
-# Apply pending migrations
+# Execute pending migrations transactionally with pre-push verification
 tern apply
 ```
+
+### 6. Verify Integrity & CI/CD Validation (`tern verify`)
+
+Run automated verification of configuration, declarative schema DDL syntax, lockfile checksums, and optional remote database drift in CI/CD pipelines before merging or deploying:
+
+```bash
+# Validate local configuration, DDL syntax, and migration checksums
+tern verify
+
+# Validate including remote target database alignment
+tern verify --url postgres://postgres:password@localhost:5432/mydb
+```
+
+Exits with `0` on success and non-zero on any integrity violation (tampered migrations, untracked files, missing lockfile, syntax errors, or remote drift).
 
 ---
 

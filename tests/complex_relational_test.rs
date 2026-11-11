@@ -85,6 +85,8 @@ async fn test_large_complex_sqlite_relational_network() {
         filter: FilterConfig {
             include_tables: vec![],
             exclude_tables: vec!["_tern_migrations".to_string()],
+            include_schemas: vec![],
+            exclude_schemas: vec![],
         },
     };
 

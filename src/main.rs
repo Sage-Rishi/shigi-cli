@@ -5,6 +5,7 @@ use tern::config::{self, TernConfig};
 use tern::db;
 use tern::differential_engine;
 use tern::engine;
+use tern::verify;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             diff_res?;
         }
+        Some(Commands::Verify { url, config }) => {
+            verify::run_verify(url.clone(), config.clone()).await?;
+        }
         Some(Commands::Status { url }) => {
             let config = TernConfig::load()?;
             config::verify_lockfile(&config.paths.migrations_dir)?;
@@ -64,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         None => {
-            println!("No command provided. Run `tern init`, `tern generate`, `tern status`, or `tern apply`.");
+            println!("No command provided. Run `tern init`, `tern generate`, `tern verify`, `tern status`, or `tern apply`.");
         }
     }
 

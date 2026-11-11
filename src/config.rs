@@ -27,10 +27,16 @@ pub struct PathConfig {
     pub migrations_dir: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct FilterConfig {
+    #[serde(default)]
     pub include_tables: Vec<String>,
+    #[serde(default)]
     pub exclude_tables: Vec<String>,
+    #[serde(default)]
+    pub include_schemas: Vec<String>,
+    #[serde(default)]
+    pub exclude_schemas: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -95,28 +101,54 @@ pub fn compute_migrations_lock(
 
 /// Verifies that existing migration files haven't been tampered with
 pub fn verify_lockfile(migrations_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let lock_path = Path::new(migrations_dir).join(LOCK_FILE);
-    if !lock_path.exists() {
+    let dir = Path::new(migrations_dir);
+    let lock_path = dir.join(LOCK_FILE);
+    let current_lock = compute_migrations_lock(migrations_dir)?;
+
+    if current_lock.files.is_empty() {
+        if lock_path.exists() {
+            let lock_content = fs::read_to_string(&lock_path)?;
+            let existing_lock: MigrationLock = toml::from_str(&lock_content)?;
+            if !existing_lock.files.is_empty() {
+                return Err(format!(
+                    "Integrity Error: '{}' tracks {} migration(s), but no .sql files were found in '{}'!",
+                    LOCK_FILE,
+                    existing_lock.files.len(),
+                    migrations_dir
+                )
+                .into());
+            }
+        }
         return Ok(());
+    }
+
+    if !lock_path.exists() {
+        return Err(format!(
+            "Integrity Error: Found {} migration file(s) in '{}', but '{}' is missing! Run `tern generate` to create the lockfile.",
+            current_lock.files.len(),
+            migrations_dir,
+            LOCK_FILE
+        )
+        .into());
     }
 
     let lock_content = fs::read_to_string(&lock_path)?;
     let existing_lock: MigrationLock = toml::from_str(&lock_content)?;
-    let current_lock = compute_migrations_lock(migrations_dir)?;
 
+    // Check for modified or missing files
     for (file, old_hash) in &existing_lock.files {
         match current_lock.files.get(file) {
             Some(curr_hash) if curr_hash != old_hash => {
                 return Err(format!(
-                    "Integrity Error: Migration '{}' was modified! Expected {}, got {}",
+                    "Integrity Error: Migration '{}' was modified! Expected SHA-256 {}, got {}",
                     file, old_hash, curr_hash
                 )
                 .into());
             }
             None => {
                 return Err(format!(
-                    "Integrity Error: Previously tracked migration '{}' is missing!",
-                    file
+                    "Integrity Error: Previously tracked migration '{}' is missing from '{}'!",
+                    file, migrations_dir
                 )
                 .into());
             }
@@ -124,15 +156,27 @@ pub fn verify_lockfile(migrations_dir: &str) -> Result<(), Box<dyn std::error::E
         }
     }
 
-    if existing_lock.files.len() == current_lock.files.len()
-        && existing_lock.total_hash != current_lock.total_hash
-    {
-        return Err("Total migration hash mismatch! Lockfile is out of sync.".into());
+    // Check for untracked new files on disk not recorded in the lockfile
+    for file in current_lock.files.keys() {
+        if !existing_lock.files.contains_key(file) {
+            return Err(format!(
+                "Integrity Error: Untracked migration file '{}' found in '{}'! It is not recorded in '{}'.",
+                file, migrations_dir, LOCK_FILE
+            )
+            .into());
+        }
+    }
+
+    if existing_lock.total_hash != current_lock.total_hash {
+        return Err(
+            "Integrity Error: Total migration hash mismatch! Lockfile is out of sync.".into(),
+        );
     }
 
     println!(
-        "-> Migration hashes verified (Total Hash: {}...)",
-        &current_lock.total_hash[..12]
+        "-> Migration hashes verified against {} (Total Hash: {}...)",
+        LOCK_FILE,
+        &current_lock.total_hash[..12.min(current_lock.total_hash.len())]
     );
     Ok(())
 }

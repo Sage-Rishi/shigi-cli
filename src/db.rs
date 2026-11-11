@@ -308,6 +308,56 @@ pub async fn check_status(
     Ok(())
 }
 
+/// Verifies that all applied migrations in the target database match local SHA-256 checksums
+pub async fn verify_target_checksums(
+    pool: &AnyPool,
+    migrations_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let applied = get_applied_migrations(pool).await?;
+    let local_lock = compute_migrations_lock(migrations_dir)?;
+
+    let mut drift_detected = false;
+
+    for (filename, (db_hash, applied_at)) in &applied {
+        match local_lock.files.get(filename) {
+            Some(local_hash) if local_hash != db_hash => {
+                eprintln!(
+                    "-> DRIFT DETECTED: Migration '{}' was modified locally after being applied at {}!\n   DB Checksum:    {}\n   Local Checksum: {}",
+                    filename, applied_at, db_hash, local_hash
+                );
+                drift_detected = true;
+            }
+            None => {
+                eprintln!(
+                    "-> MISSING LOCAL: Migration '{}' was applied at {} in the database, but is missing from '{}'!",
+                    filename, applied_at, migrations_dir
+                );
+                drift_detected = true;
+            }
+            _ => {}
+        }
+    }
+
+    if drift_detected {
+        return Err("Integrity Error: Database checksum drift detected!".into());
+    }
+
+    let mut pending_count = 0;
+    for filename in local_lock.files.keys() {
+        if !applied.contains_key(filename) {
+            pending_count += 1;
+        }
+    }
+
+    println!(
+        "   Database state: {} applied migration(s), {} pending migration(s).",
+        applied.len(),
+        pending_count
+    );
+
+    Ok(())
+}
+
 /// Applies pending migrations to the target database and records them in `_tern_migrations`
 pub async fn apply_target_migrations(
     pool: &AnyPool,
@@ -315,29 +365,14 @@ pub async fn apply_target_migrations(
     migrations_dir: &str,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Verify integrity of local migrations against tern.lock
+    crate::config::verify_lockfile(migrations_dir)?;
+
+    // 2. Verify integrity against already-applied database records (checksum drift check)
+    verify_target_checksums(pool, migrations_dir).await?;
+
     let applied = get_applied_migrations(pool).await?;
     let local_lock = compute_migrations_lock(migrations_dir)?;
-
-    // 1. Verify integrity against already-applied database records
-    for (filename, (db_hash, _)) in &applied {
-        match local_lock.files.get(filename) {
-            Some(local_hash) if local_hash != db_hash => {
-                return Err(format!(
-                    "Integrity Error: Applied migration '{}' was modified locally! DB checksum: {}, Local checksum: {}",
-                    filename, db_hash, local_hash
-                )
-                .into());
-            }
-            None => {
-                return Err(format!(
-                    "Integrity Error: Migration '{}' is applied in the database but missing from '{}'!",
-                    filename, migrations_dir
-                )
-                .into());
-            }
-            _ => {}
-        }
-    }
 
     // 2. Collect pending migrations in chronological order
     let mut pending: Vec<(String, String)> = Vec::new();
@@ -351,6 +386,11 @@ pub async fn apply_target_migrations(
         println!("-> Target database is up to date! No pending migrations to apply.");
         return Ok(());
     }
+
+    println!(
+        "-> Pre-push verification passed: {} pending migration checksum(s) validated against lockfile.",
+        pending.len()
+    );
 
     if dry_run {
         println!(

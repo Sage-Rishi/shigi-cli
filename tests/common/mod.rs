@@ -120,6 +120,8 @@ pub async fn simulate_tern_generate(
         filter: FilterConfig {
             include_tables: vec![],
             exclude_tables: vec!["_tern_migrations".to_string()],
+            include_schemas: vec![],
+            exclude_schemas: vec![],
         },
     };
 

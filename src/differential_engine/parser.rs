@@ -1,7 +1,7 @@
 use super::model::{
-    clean_ident, extract_table_name, should_include_table, NormalizedColumn, NormalizedEnum,
-    NormalizedForeignKey, NormalizedFunction, NormalizedIndex, NormalizedSchema, NormalizedTable,
-    NormalizedTrigger,
+    clean_ident, extract_schema_name, extract_table_name, should_include_schema,
+    should_include_table_with_schema, NormalizedColumn, NormalizedEnum, NormalizedForeignKey,
+    NormalizedFunction, NormalizedIndex, NormalizedSchema, NormalizedTable, NormalizedTrigger,
 };
 use crate::config::TernConfig;
 use sqlparser::ast::{ColumnOption, Statement, TableConstraint};
@@ -11,7 +11,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn extract_enums_from_sql(sql: &str) -> (BTreeMap<String, NormalizedEnum>, String) {
+pub fn extract_enums_from_sql(
+    db_type: &str,
+    sql: &str,
+    config: &TernConfig,
+) -> (BTreeMap<String, NormalizedEnum>, String) {
     let mut enums = BTreeMap::new();
     let mut remaining = String::new();
     let chars: Vec<char> = sql.chars().collect();
@@ -37,6 +41,24 @@ pub fn extract_enums_from_sql(sql: &str) -> (BTreeMap<String, NormalizedEnum>, S
                             .last()
                             .map(clean_ident)
                             .unwrap_or_default();
+
+                        let default_schema = if db_type == "postgres" {
+                            Some("public")
+                        } else {
+                            None
+                        };
+                        let s_name = if let Some((s, _)) = type_name.split_once('.') {
+                            Some(s)
+                        } else {
+                            default_schema
+                        };
+
+                        if let Some(s) = s_name {
+                            if !should_include_schema(s, config) {
+                                i += semi_pos + 1;
+                                continue;
+                            }
+                        }
 
                         if let (Some(lparen), Some(rparen)) =
                             (stmt_str.find('('), stmt_str.rfind(')'))
@@ -71,7 +93,11 @@ pub fn extract_enums_from_sql(sql: &str) -> (BTreeMap<String, NormalizedEnum>, S
     (enums, remaining)
 }
 
-pub fn extract_triggers_from_sql(sql: &str) -> (BTreeMap<String, NormalizedTrigger>, String) {
+pub fn extract_triggers_from_sql(
+    db_type: &str,
+    sql: &str,
+    config: &TernConfig,
+) -> (BTreeMap<String, NormalizedTrigger>, String) {
     let mut triggers = BTreeMap::new();
     let mut remaining = String::new();
     let chars: Vec<char> = sql.chars().collect();
@@ -144,15 +170,31 @@ pub fn extract_triggers_from_sql(sql: &str) -> (BTreeMap<String, NormalizedTrigg
                             .unwrap_or_default();
 
                         if !trig_name.is_empty() && !tbl_name.is_empty() {
-                            let key = format!("{}_{}", tbl_name, trig_name);
-                            triggers.insert(
-                                key,
-                                NormalizedTrigger {
-                                    name: trig_name,
-                                    table: tbl_name,
-                                    definition: stmt_str.trim().trim_end_matches(';').to_string(),
-                                },
-                            );
+                            let default_schema = if db_type == "postgres" {
+                                Some("public")
+                            } else {
+                                None
+                            };
+                            let s_name = if let Some((s, _)) = tbl_name.split_once('.') {
+                                Some(s)
+                            } else {
+                                default_schema
+                            };
+
+                            if should_include_table_with_schema(s_name, &tbl_name, config) {
+                                let key = format!("{}_{}", tbl_name, trig_name);
+                                triggers.insert(
+                                    key,
+                                    NormalizedTrigger {
+                                        name: trig_name,
+                                        table: tbl_name,
+                                        definition: stmt_str
+                                            .trim()
+                                            .trim_end_matches(';')
+                                            .to_string(),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -170,6 +212,7 @@ pub fn extract_triggers_from_sql(sql: &str) -> (BTreeMap<String, NormalizedTrigg
 pub fn extract_functions_from_sql(
     db_type: &str,
     sql: &str,
+    config: &TernConfig,
 ) -> (BTreeMap<String, NormalizedFunction>, String) {
     let mut functions = BTreeMap::new();
     let mut remaining = String::new();
@@ -251,6 +294,24 @@ pub fn extract_functions_from_sql(
                         .map(clean_ident)
                         .unwrap_or_default();
 
+                    let default_schema = if db_type == "postgres" {
+                        Some("public")
+                    } else {
+                        None
+                    };
+                    let s_name = if let Some((s, _)) = func_name.split_once('.') {
+                        Some(s)
+                    } else {
+                        default_schema
+                    };
+
+                    if let Some(s) = s_name {
+                        if !should_include_schema(s, config) {
+                            i += semi_pos + 1;
+                            continue;
+                        }
+                    }
+
                     let mut arg_types = Vec::new();
                     if let (Some(lparen), Some(rparen)) = (stmt_str.find('('), stmt_str.find(')')) {
                         if rparen > lparen {
@@ -325,9 +386,9 @@ pub fn parse_target_schema(
         combined_sql.push('\n');
     }
 
-    let (enums, without_enums) = extract_enums_from_sql(&combined_sql);
-    let (triggers, without_triggers) = extract_triggers_from_sql(&without_enums);
-    let (functions, remaining_sql) = extract_functions_from_sql(db_type, &without_triggers);
+    let (enums, without_enums) = extract_enums_from_sql(db_type, &combined_sql, config);
+    let (triggers, without_triggers) = extract_triggers_from_sql(db_type, &without_enums, config);
+    let (functions, remaining_sql) = extract_functions_from_sql(db_type, &without_triggers, config);
 
     let mut schema = NormalizedSchema {
         tables: BTreeMap::new(),
@@ -349,7 +410,14 @@ pub fn parse_target_schema(
         match stmt {
             Statement::CreateTable(ref create_table) => {
                 let t_name = extract_table_name(&create_table.name);
-                if !should_include_table(&t_name, config) {
+                let s_name = extract_schema_name(&create_table.name);
+                let default_schema = match db_type {
+                    "postgres" => Some("public"),
+                    "sqlite" => Some("main"),
+                    _ => None,
+                };
+                let effective_schema = s_name.as_deref().or(default_schema);
+                if !should_include_table_with_schema(effective_schema, &t_name, config) {
                     continue;
                 }
 
@@ -482,7 +550,14 @@ pub fn parse_target_schema(
             }
             Statement::CreateIndex(create_idx) => {
                 let t_name = extract_table_name(&create_idx.table_name);
-                if !should_include_table(&t_name, config) {
+                let s_name = extract_schema_name(&create_idx.table_name);
+                let default_schema = match db_type {
+                    "postgres" => Some("public"),
+                    "sqlite" => Some("main"),
+                    _ => None,
+                };
+                let effective_schema = s_name.as_deref().or(default_schema);
+                if !should_include_table_with_schema(effective_schema, &t_name, config) {
                     continue;
                 }
                 let idx_cols: Vec<String> = create_idx
@@ -509,6 +584,17 @@ pub fn parse_target_schema(
                 ref name, ref args, ..
             } => {
                 let f_name = extract_table_name(name);
+                let s_name = extract_schema_name(name);
+                let default_schema = if db_type == "postgres" {
+                    Some("public")
+                } else {
+                    None
+                };
+                if let Some(s) = s_name.as_deref().or(default_schema) {
+                    if !should_include_schema(s, config) {
+                        continue;
+                    }
+                }
                 let definition = stmt.to_string();
 
                 let arg_types: Vec<String> = args

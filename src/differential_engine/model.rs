@@ -62,15 +62,36 @@ pub struct NormalizedSchema {
     pub functions: BTreeMap<String, NormalizedFunction>,
 }
 
-pub fn should_include_table(table_name: &str, config: &TernConfig) -> bool {
-    if table_name.eq_ignore_ascii_case("_tern_migrations") {
+pub fn should_include_schema(schema_name: &str, config: &TernConfig) -> bool {
+    let clean = clean_ident(schema_name);
+    if config
+        .filter
+        .exclude_schemas
+        .iter()
+        .any(|s| clean_ident(s).eq_ignore_ascii_case(&clean))
+    {
+        return false;
+    }
+    if !config.filter.include_schemas.is_empty() {
+        return config
+            .filter
+            .include_schemas
+            .iter()
+            .any(|s| clean_ident(s).eq_ignore_ascii_case(&clean));
+    }
+    true
+}
+
+pub fn should_include_bare_table(table_name: &str, config: &TernConfig) -> bool {
+    let clean = clean_ident(table_name);
+    if clean.eq_ignore_ascii_case("_tern_migrations") {
         return false;
     }
     if config
         .filter
         .exclude_tables
         .iter()
-        .any(|t| t.eq_ignore_ascii_case(table_name))
+        .any(|t| clean_ident(t).eq_ignore_ascii_case(&clean))
     {
         return false;
     }
@@ -79,9 +100,33 @@ pub fn should_include_table(table_name: &str, config: &TernConfig) -> bool {
             .filter
             .include_tables
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(table_name));
+            .any(|t| clean_ident(t).eq_ignore_ascii_case(&clean));
     }
     true
+}
+
+pub fn should_include_table(table_name: &str, config: &TernConfig) -> bool {
+    let clean = clean_ident(table_name);
+    if let Some((schema, tbl)) = clean.split_once('.') {
+        if !should_include_schema(schema, config) {
+            return false;
+        }
+        return should_include_bare_table(tbl, config);
+    }
+    should_include_bare_table(&clean, config)
+}
+
+pub fn should_include_table_with_schema(
+    schema_name: Option<&str>,
+    table_name: &str,
+    config: &TernConfig,
+) -> bool {
+    if let Some(schema) = schema_name {
+        if !should_include_schema(schema, config) {
+            return false;
+        }
+    }
+    should_include_table(table_name, config)
 }
 
 pub fn clean_ident(s: &str) -> String {
@@ -94,6 +139,14 @@ pub fn extract_table_name(obj: &ObjectName) -> String {
         .last()
         .map(|i| clean_ident(&i.value))
         .unwrap_or_default()
+}
+
+pub fn extract_schema_name(obj: &ObjectName) -> Option<String> {
+    if obj.0.len() > 1 {
+        Some(clean_ident(&obj.0[0].value))
+    } else {
+        None
+    }
 }
 
 pub fn normalize_type(dtype: &str) -> String {

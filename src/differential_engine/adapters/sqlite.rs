@@ -1,8 +1,9 @@
 use super::{BoxFuture, DatabaseAdapter};
 use crate::config::TernConfig;
 use crate::differential_engine::model::{
-    should_include_table, NormalizedColumn, NormalizedForeignKey, NormalizedFunction,
-    NormalizedIndex, NormalizedSchema, NormalizedTable, NormalizedTrigger,
+    should_include_schema, should_include_table_with_schema, NormalizedColumn,
+    NormalizedForeignKey, NormalizedFunction, NormalizedIndex, NormalizedSchema, NormalizedTable,
+    NormalizedTrigger,
 };
 use sea_schema::sqlite::discovery::SchemaDiscovery as SqliteDiscovery;
 use sqlx::{Row, SqlitePool};
@@ -18,13 +19,18 @@ impl DatabaseAdapter for SqliteAdapter {
     ) -> BoxFuture<'a, Result<NormalizedSchema, Box<dyn std::error::Error>>> {
         Box::pin(async move {
             let mut schema = NormalizedSchema::default();
+            let schema_name = "main";
+            if !should_include_schema(schema_name, config) {
+                return Ok(schema);
+            }
+
             let pool = SqlitePool::connect(db_url).await?;
             let live_schema = SqliteDiscovery::new(pool.clone()).discover().await?;
 
             // 1. Fetch tables, columns, PKs
             for t in live_schema.tables {
                 let t_name = t.name.to_lowercase();
-                if !should_include_table(&t_name, config) {
+                if !should_include_table_with_schema(Some(schema_name), &t_name, config) {
                     continue;
                 }
 

@@ -1,8 +1,9 @@
 use super::{BoxFuture, DatabaseAdapter};
 use crate::config::TernConfig;
 use crate::differential_engine::model::{
-    should_include_table, NormalizedColumn, NormalizedForeignKey, NormalizedFunction,
-    NormalizedIndex, NormalizedSchema, NormalizedTable, NormalizedTrigger,
+    should_include_schema, should_include_table_with_schema, NormalizedColumn,
+    NormalizedForeignKey, NormalizedFunction, NormalizedIndex, NormalizedSchema, NormalizedTable,
+    NormalizedTrigger,
 };
 use sea_schema::mysql::discovery::SchemaDiscovery as MySqlDiscovery;
 use sqlx::{MySqlPool, Row};
@@ -18,15 +19,20 @@ impl DatabaseAdapter for MySqlAdapter {
     ) -> BoxFuture<'a, Result<NormalizedSchema, Box<dyn std::error::Error>>> {
         Box::pin(async move {
             let mut schema = NormalizedSchema::default();
+            let db_name = "tern_db";
+            if !should_include_schema(db_name, config) {
+                return Ok(schema);
+            }
+
             let pool = MySqlPool::connect(db_url).await?;
-            let live_schema = MySqlDiscovery::new(pool.clone(), "tern_db")
+            let live_schema = MySqlDiscovery::new(pool.clone(), db_name)
                 .discover()
                 .await?;
 
             // 1. Fetch live tables, columns, indexes, and FKs
             for t in live_schema.tables {
                 let t_name = t.info.name.to_lowercase();
-                if !should_include_table(&t_name, config) {
+                if !should_include_table_with_schema(Some(db_name), &t_name, config) {
                     continue;
                 }
 
